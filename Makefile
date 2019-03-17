@@ -1,8 +1,8 @@
 filename = *.c
-output   = kilo_serial.out
+output   = kilo_serial.out kilo_parallel.out
 CC	     = gcc
-FLAGS    = -Wall -Wextra -pedantic -std=c99 -pthread
-args	 = input.txt 3			#to set the default value of arguments
+FLAGS    = -Wall -Wextra -pedantic -pthread
+args	 = input.c 			#to set the default value of arguments
 compile  = $(CC) $< -o $@ $(FLAGS)
 
 all : $(output)

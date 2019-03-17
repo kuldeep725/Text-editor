@@ -17,6 +17,10 @@
 #include <time.h>
 #include <unistd.h>
 
+// New includes
+#include <pthread.h>
+#include <semaphore.h>
+
 /*** defines ***/
 
 #define KILO_VERSION "0.0.1"
@@ -47,6 +51,13 @@ enum editorHighlight {
   HL_STRING,
   HL_NUMBER,
   HL_MATCH
+};
+
+enum EditorState {
+  RUNNING,
+  LOADING,
+  SAVING,
+  FINISHED
 };
 
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
@@ -84,6 +95,7 @@ struct editorConfig {
   int numrows;
   erow *row;
   int dirty;
+  int state;
   char *filename;
   char statusmsg[80];
   time_t statusmsg_time;
@@ -116,6 +128,14 @@ struct editorSyntax HLDB[] = {
 
 #define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
+/*** semaphores ***/
+sem_t load_sem;
+sem_t save_sem;
+
+/*** mutexes ***/
+pthread_mutex_t numrow_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
 /*** prototypes ***/
 
 void editorSetStatusMessage(const char *fmt, ...);
@@ -146,18 +166,21 @@ void enableRawMode() {
   raw.c_oflag &= ~(OPOST);
   raw.c_cflag |= (CS8);
   raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-  raw.c_cc[VMIN] = 0;
-  raw.c_cc[VTIME] = 1;
+  raw.c_cc[VMIN] = 1;
+  // raw.c_cc[VTIME] = 1;
 
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
 
 int editorReadKey() {
-  int nread;
+  // int nread;
   char c;
-  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
-    if (nread == -1 && errno != EAGAIN) die("read");
-  }
+
+  read (STDIN_FILENO, &c, 1);
+
+  // while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+  //   if (nread == -1 && errno != EAGAIN) die("read");
+  // }
 
   if (c == '\x1b') {
     char seq[3];
@@ -194,7 +217,7 @@ int editorReadKey() {
         case 'H': return HOME_KEY;
         case 'F': return END_KEY;
       }
-    }
+    } 
 
     return '\x1b';
   } else {
@@ -445,7 +468,7 @@ void editorUpdateRow(erow *row) {
   editorUpdateSyntax(row);
 }
 
-void editorInsertRow(int at, char *s, size_t len) {
+void editorInsertRow(int at, char *s, size_t len, int isFile) {
   if (at < 0 || at > E.numrows) return;
 
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
@@ -466,7 +489,8 @@ void editorInsertRow(int at, char *s, size_t len) {
   editorUpdateRow(&E.row[at]);
 
   E.numrows++;
-  E.dirty++;
+  if (!isFile)
+    E.dirty++;
 }
 
 void editorFreeRow(erow *row) {
@@ -480,6 +504,7 @@ void editorDelRow(int at) {
   editorFreeRow(&E.row[at]);
   memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
   for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
+  
   E.numrows--;
   E.dirty++;
 }
@@ -515,18 +540,26 @@ void editorRowDelChar(erow *row, int at) {
 
 void editorInsertChar(int c) {
   if (E.cy == E.numrows) {
-    editorInsertRow(E.numrows, "", 0);
+    pthread_mutex_lock (&numrow_mutex);
+    editorInsertRow(E.numrows, "", 0, 0);
+    pthread_mutex_unlock (&numrow_mutex);
+
   }
   editorRowInsertChar(&E.row[E.cy], E.cx, c);
   E.cx++;
 }
 
 void editorInsertNewline() {
+  pthread_mutex_lock (&numrow_mutex);
+
   if (E.cx == 0) {
-    editorInsertRow(E.cy, "", 0);
+    editorInsertRow(E.cy, "", 0, 0);
+    pthread_mutex_unlock (&numrow_mutex);
   } else {
     erow *row = &E.row[E.cy];
-    editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+    editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx, 0);
+    pthread_mutex_unlock (&numrow_mutex);
+
     row = &E.row[E.cy];
     row->size = E.cx;
     row->chars[row->size] = '\0';
@@ -547,7 +580,11 @@ void editorDelChar() {
   } else {
     E.cx = E.row[E.cy - 1].size;
     editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
+
+    pthread_mutex_lock (&numrow_mutex);
     editorDelRow(E.cy);
+    pthread_mutex_unlock (&numrow_mutex);
+
     E.cy--;
   }
 }
@@ -573,13 +610,16 @@ char *editorRowsToString(int *buflen) {
   return buf;
 }
 
-void editorOpen(char *filename) {
+void *editorOpen(void *filename) {
+
+  char *myfilename = (char *) filename;
   free(E.filename);
-  E.filename = strdup(filename);
+  E.filename = strdup(myfilename);
+  E.state = LOADING;
 
   editorSelectSyntaxHighlight();
 
-  FILE *fp = fopen(filename, "r");
+  FILE *fp = fopen(E.filename, "r");
   if (!fp) die("fopen");
 
   char *line = NULL;
@@ -589,42 +629,82 @@ void editorOpen(char *filename) {
     while (linelen > 0 && (line[linelen - 1] == '\n' ||
                            line[linelen - 1] == '\r'))
       linelen--;
-    editorInsertRow(E.numrows, line, linelen);
+
+    pthread_mutex_lock (&numrow_mutex);
+
+    editorInsertRow(E.numrows, line, linelen, 1);
+    if (E.numrows == 100) {
+      sem_post (&load_sem);
+    }
+    if (!(E.numrows % 1000) && E.state != FINISHED) {
+      editorRefreshScreen();
+    }
+
+    pthread_mutex_unlock (&numrow_mutex);
   }
   free(line);
   fclose(fp);
-  E.dirty = 0;
+
+  sem_post (&load_sem);
+  E.state = RUNNING;
+  editorRefreshScreen(&load_sem);
+
+  return NULL;
+}
+
+void *editorSaveToDisk () {
+
+  while (E.state != FINISHED) {
+
+    sem_wait (&save_sem);
+
+    if (E.state == FINISHED) 
+      break;
+
+    E.state = SAVING;
+    int len;
+    char *buf = editorRowsToString(&len);
+
+    int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+    if (fd != -1) {
+      if (ftruncate(fd, len) != -1) {
+        if (write(fd, buf, len) == len) {
+          close(fd);
+          free(buf);
+          E.dirty = 0;
+          editorSetStatusMessage("%d bytes written to disk", len);
+          E.state = RUNNING;
+          editorRefreshScreen();
+          continue;
+        }
+      }
+      close(fd);
+    }
+
+    free(buf);
+    editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+
+    E.state = RUNNING;
+  }
+
+  return NULL;
+
 }
 
 void editorSave() {
+
   if (E.filename == NULL) {
     E.filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
     if (E.filename == NULL) {
       editorSetStatusMessage("Save aborted");
       return;
     }
+    sem_post (&save_sem);
     editorSelectSyntaxHighlight();
+  } else {
+    sem_post (&save_sem);
   }
-
-  int len;
-  char *buf = editorRowsToString(&len);
-
-  int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
-  if (fd != -1) {
-    if (ftruncate(fd, len) != -1) {
-      if (write(fd, buf, len) == len) {
-        close(fd);
-        free(buf);
-        E.dirty = 0;
-        editorSetStatusMessage("%d bytes written to disk", len);
-        return;
-      }
-    }
-    close(fd);
-  }
-
-  free(buf);
-  editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+  
 }
 
 /*** find ***/
@@ -839,26 +919,28 @@ void editorDrawMessageBar(struct abuf *ab) {
 }
 
 void editorRefreshScreen() {
-  editorScroll();
 
-  struct abuf ab = ABUF_INIT;
+    editorScroll();
 
-  abAppend(&ab, "\x1b[?25l", 6);
-  abAppend(&ab, "\x1b[H", 3);
+    struct abuf ab = ABUF_INIT;
 
-  editorDrawRows(&ab);
-  editorDrawStatusBar(&ab);
-  editorDrawMessageBar(&ab);
+    abAppend(&ab, "\x1b[?25l", 6);
+    abAppend(&ab, "\x1b[H", 3);
 
-  char buf[32];
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-                                            (E.rx - E.coloff) + 1);
-  abAppend(&ab, buf, strlen(buf));
+    editorDrawRows(&ab);
+    editorDrawStatusBar(&ab);
+    editorDrawMessageBar(&ab);
 
-  abAppend(&ab, "\x1b[?25h", 6);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
+                                              (E.rx - E.coloff) + 1);
+    abAppend(&ab, buf, strlen(buf));
 
-  write(STDOUT_FILENO, ab.b, ab.len);
-  abFree(&ab);
+    abAppend(&ab, "\x1b[?25h", 6);
+
+    write(STDOUT_FILENO, ab.b, ab.len);
+    abFree(&ab);
+
 }
 
 void editorSetStatusMessage(const char *fmt, ...) {
@@ -949,84 +1031,109 @@ void editorMoveCursor(int key) {
 }
 
 void editorProcessKeypress() {
-  static int quit_times = KILO_QUIT_TIMES;
 
-  int c = editorReadKey();
+    static int quit_times = KILO_QUIT_TIMES;
 
-  switch (c) {
-    case '\r':
-      editorInsertNewline();
-      break;
+    int c = editorReadKey();
 
-    case CTRL_KEY('q'):
-      if (E.dirty && quit_times > 0) {
-        editorSetStatusMessage("WARNING!!! File has unsaved changes. "
-          "Press Ctrl-Q %d more times to quit.", quit_times);
-        quit_times--;
-        return;
-      }
-      write(STDOUT_FILENO, "\x1b[2J", 4);
-      write(STDOUT_FILENO, "\x1b[H", 3);
-      exit(0);
-      break;
+    switch (c) {
+      case '\r':
+        editorInsertNewline();
+        break;
 
-    case CTRL_KEY('s'):
-      editorSave();
-      break;
-
-    case HOME_KEY:
-      E.cx = 0;
-      break;
-
-    case END_KEY:
-      if (E.cy < E.numrows)
-        E.cx = E.row[E.cy].size;
-      break;
-
-    case CTRL_KEY('f'):
-      editorFind();
-      break;
-
-    case BACKSPACE:
-    case CTRL_KEY('h'):
-    case DEL_KEY:
-      if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
-      editorDelChar();
-      break;
-
-    case PAGE_UP:
-    case PAGE_DOWN:
-      {
-        if (c == PAGE_UP) {
-          E.cy = E.rowoff;
-        } else if (c == PAGE_DOWN) {
-          E.cy = E.rowoff + E.screenrows - 1;
-          if (E.cy > E.numrows) E.cy = E.numrows;
+      case CTRL_KEY('q'):
+        if (E.state == SAVING) {
+          editorSetStatusMessage ("FILE SAVING : Can't quit.");
+          break;
         }
+        if (E.dirty && quit_times > 0) {
+          editorSetStatusMessage("WARNING!!! File has unsaved changes. "
+            "Press Ctrl-Q %d more times to quit.", quit_times);
+          quit_times--;
+          return;
+        }
+        
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
 
-        int times = E.screenrows;
-        while (times--)
-          editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
-      }
-      break;
+        // to prevent other thread use "E.state" while "E.state" is being assigned
+        pthread_mutex_lock (&numrow_mutex);
+        E.state = FINISHED;
+        pthread_mutex_unlock (&numrow_mutex);
 
-    case ARROW_UP:
-    case ARROW_DOWN:
-    case ARROW_LEFT:
-    case ARROW_RIGHT:
-      editorMoveCursor(c);
-      break;
+        sem_post (&save_sem);
+        break;
 
-    case CTRL_KEY('l'):
-    case '\x1b':
-      break;
+      case CTRL_KEY('s'):
+        if (E.state == LOADING) {
+          editorSetStatusMessage ("FILE STILL LOADING : File can't be saved.");
+          break;
+        }
+        if (E.state == SAVING) {
+          editorSetStatusMessage ("FILE SAVING : Wait for the next save.");
+          break;
+        }
+        editorSave();
+        break;
 
-    default:
-      editorInsertChar(c);
-      break;
-  }
+      case HOME_KEY:
+        E.cx = 0;
+        break;
 
-  quit_times = KILO_QUIT_TIMES;
+      case END_KEY:
+        if (E.cy < E.numrows)
+          E.cx = E.row[E.cy].size;
+        break;
+
+      case CTRL_KEY('f'):
+        if (E.state == LOADING) {
+          editorSetStatusMessage ("FILE STILL LOADING : Search not available");
+          break;
+        }
+        editorFind();
+        break;
+
+      case BACKSPACE:
+      case CTRL_KEY('h'):
+      case DEL_KEY:
+        if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+        editorDelChar();
+        break;
+
+      case PAGE_UP:
+      case PAGE_DOWN:
+        {
+          if (c == PAGE_UP) {
+            E.cy = E.rowoff;
+          } else if (c == PAGE_DOWN) {
+            E.cy = E.rowoff + E.screenrows - 1;
+            if (E.cy > E.numrows) E.cy = E.numrows;
+          }
+
+          int times = E.screenrows;
+          while (times--)
+            editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+        }
+        break;
+
+      case ARROW_UP:
+      case ARROW_DOWN:
+      case ARROW_LEFT:
+      case ARROW_RIGHT:
+        editorMoveCursor(c);
+        break;
+
+      case CTRL_KEY('l'):
+      case '\x1b':
+        break;
+
+      default:
+        editorInsertChar(c);
+        break;
+    }
+
+    quit_times = KILO_QUIT_TIMES;
+
 }
 
 /*** init ***/
@@ -1040,6 +1147,7 @@ void initEditor() {
   E.numrows = 0;
   E.row = NULL;
   E.dirty = 0;
+  E.state = RUNNING;
   E.filename = NULL;
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
@@ -1053,16 +1161,28 @@ int main(int argc, char *argv[]) {
   enableRawMode();
   initEditor();
   if (argc >= 2) {
-    editorOpen(argv[1]);
+    // editorOpen(argv[1]);
+    pthread_t editoropen_thread;
+    sem_init (&load_sem, 0, 0);
+
+    pthread_create (&editoropen_thread, NULL, editorOpen, (void *) argv[1]);
+    sem_wait (&load_sem);
   }
+
+  pthread_t save_thread;
+  sem_init (&save_sem, 0, 0);
+
+  pthread_create (&save_thread, NULL, editorSaveToDisk, NULL);
 
   editorSetStatusMessage(
     "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
-  while (1) {
+  while (E.state != FINISHED) {
     editorRefreshScreen();
     editorProcessKeypress();
   }
+
+  pthread_join (save_thread, NULL);
 
   return 0;
 }
