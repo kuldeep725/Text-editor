@@ -1,3 +1,5 @@
+
+
 /*** includes ***/
 
 #define _DEFAULT_SOURCE
@@ -167,7 +169,6 @@ void enableRawMode() {
   raw.c_cflag |= (CS8);
   raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
   raw.c_cc[VMIN] = 1;
-  // raw.c_cc[VTIME] = 1;
 
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
@@ -177,10 +178,6 @@ int editorReadKey() {
   char c;
 
   read (STDIN_FILENO, &c, 1);
-
-  // while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
-  //   if (nread == -1 && errno != EAGAIN) die("read");
-  // }
 
   if (c == '\x1b') {
     char seq[3];
@@ -1161,27 +1158,31 @@ int main(int argc, char *argv[]) {
   enableRawMode();
   initEditor();
   if (argc >= 2) {
-    // editorOpen(argv[1]);
+    
+    // creating a thread for reading the file
     pthread_t editoropen_thread;
     sem_init (&load_sem, 0, 0);
 
     pthread_create (&editoropen_thread, NULL, editorOpen, (void *) argv[1]);
     sem_wait (&load_sem);
+
   }
 
+  // thread for saving the file into disk
   pthread_t save_thread;
   sem_init (&save_sem, 0, 0);
-
   pthread_create (&save_thread, NULL, editorSaveToDisk, NULL);
 
   editorSetStatusMessage(
     "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
+  // until not reached the FINISHED state
   while (E.state != FINISHED) {
     editorRefreshScreen();
     editorProcessKeypress();
   }
 
+  // wait for save_thread to finish
   pthread_join (save_thread, NULL);
 
   return 0;
