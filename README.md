@@ -9,3 +9,17 @@ In this repository, a serial-text editor created by antirez is parallelized.
 2. Another parallization was done for saving the file into disk. This is done by creating a seperate
    thread for saving the file into disk which can be run in background and user can use the editor 
    meanwhile. This can be useful while writing to a big file.
+
+# How to run
+  * To run serial version  :
+      * With input file (for passing file "input.c") : 
+         * **make serial "args=input.c"**
+      * Without input file :
+         * **make serial**
+      
+  * To run parallel version :
+      * With input file (for passing file "input.c") :
+         * **make parallel "args=input.c"**
+      * Without input file : 
+         * **make parallel**
+   
